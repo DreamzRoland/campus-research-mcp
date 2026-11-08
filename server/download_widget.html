@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文献文件</title>
+<style>
+:root{color-scheme:light dark;font-family:var(--font-sans,system-ui,sans-serif);color:var(--color-text-primary,#202124);background:var(--color-background-primary,#fff)}
+*{box-sizing:border-box}body{margin:0;padding:18px}section{max-width:620px;margin:auto}h1{font-size:17px;margin:0 0 9px}p{font-size:13px;line-height:1.6;margin:6px 0;overflow-wrap:anywhere}.muted{color:var(--color-text-secondary,#666)}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button,a.button{font:inherit;font-size:13px;border-radius:9px;padding:9px 14px;border:1px solid var(--color-border-primary,#d6d6d6);background:var(--color-background-primary,#fff);color:inherit;cursor:pointer;text-decoration:none}button.primary,a.primary{background:var(--color-text-primary,#202124);color:var(--color-background-primary,#fff);border-color:transparent}button:disabled{opacity:.45;cursor:default}[hidden]{display:none!important}progress{width:100%;height:6px;margin-top:13px}.error{color:#a12622}#status{min-height:22px;margin-top:12px}@media(prefers-color-scheme:dark){:root{color:#eee;background:#202124}.muted{color:#b0b0b0}.error{color:#ffb4ab}}
+</style></head><body>
+<section aria-label="文献文件"><h1 id="title">文献文件</h1><p id="filename"></p><p id="description" class="muted">正在加载文件信息…</p>
+<div class="actions"><button id="save" disabled>保存到 Space</button><button id="prepare" disabled>准备本机下载</button><a id="download" class="button primary" hidden rel="noopener noreferrer">下载文件</a></div>
+<div class="actions"><a id="browser-download" class="button" hidden target="_blank" rel="noopener noreferrer">在浏览器下载</a><button id="copy-link" hidden>复制下载链接</button></div>
+<input id="download-url" aria-label="下载链接" readonly hidden style="width:100%;margin-top:10px">
+<progress id="progress" value="0" max="1" hidden></progress><p id="status" role="status" aria-live="polite"></p>
+<p id="saved" hidden class="muted"></p>
+</section>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const pending = new Map();
+  let sequence = 0, context = {}, artifact = null, downloadId = '', requestedDestination = 'auto';
+  let filePromise = null, uploadPromise = null, active = false, bridgeReady = false, autoStarted = false;
+  let hostCapabilities = {}, nativeDownload = false;
+  let delivery = null;
+  const prefix = 'campus-' + Math.random().toString(36).slice(2) + '-';
+  function status(text, error = false) { $('status').textContent = text; $('status').className = error ? 'error' : ''; }
+  function notify(method, params = {}) { parent.postMessage({jsonrpc:'2.0', method, params}, '*'); }
+  function rpc(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = prefix + (++sequence);
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error('操作超时，请重试。')); }, 90000);
+      pending.set(id, {resolve, reject, timer});
+      parent.postMessage({jsonrpc:'2.0', id, method, params}, '*');
+    });
+  }
+  function unwrap(raw) {
+    let candidates = [raw, raw?.result, raw?.call_tool_result, raw?.mcp_tool_result,
+      raw?.result?.call_tool_result, raw?.result?.mcp_tool_result, raw?.data].filter(Boolean);
+    let data = {}, meta = {}, error = false;
+    for (const value of candidates) {
+      const structured = value.structuredContent || value.structured_content;
+      if (structured && Object.keys(structured).length) data = {...data,...structured};
+      meta = {...meta,...(value._meta || value.meta || {})};
+      if (value.download_id || typeof value.data_base64 === 'string') meta = {...meta,...value};
+      error = error || value.isError || value.is_error || false;
+    }
+    return {data,meta,error};
+  }
+  function previousState() { return window.openai?.widgetState?.privateContent || {}; }
+  function persist(values) {
+    window.openai?.setWidgetState?.({privateContent:{...previousState(), download_id:downloadId, ...values}});
+  }
+  function applyContext(next) {
+    context = {...context,...next};
+    const vars = next.styles?.variables || {};
+    for (const [key,value] of Object.entries(vars)) if (key.startsWith('--') && typeof value === 'string') document.documentElement.style.setProperty(key,value);
+    const localFirst = context.platform === 'desktop';
+    $('save').classList.toggle('primary', !localFirst);
+    $('prepare').classList.toggle('primary', localFirst);
+    chooseDefault();
+  }
+  function ingest(raw) {
+    const {data,meta} = unwrap(raw);
+    const found = data.article || data.file || (data.file_name ? data : null);
+    if (found && meta.download_id) {
+      if (downloadId && downloadId !== meta.download_id) {
+        filePromise = uploadPromise = null; autoStarted = nativeDownload = false;
+        for (const id of ['download','browser-download','copy-link','download-url']) $(id).hidden = true;
+      }
+      artifact = found; downloadId = meta.download_id;
+      delivery = meta.delivery || null;
+      requestedDestination = data.destination || 'auto';
+      $('filename').textContent = artifact.file_name;
+      $('description').textContent = artifact.doi + ' · ' + (artifact.byte_size / 1024 / 1024).toFixed(2) + ' MiB';
+      $('save').disabled = $('prepare').disabled = active;
+      if (!active && !autoStarted) status('文件已就绪。'); chooseDefault();
+    }
+  }
+  async function callChunk(offset) {
+    const raw = bridgeReady ? await rpc('tools/call',{name:'read_article_chunk',arguments:{download_id:downloadId,offset}})
+      : await window.openai.callTool('read_article_chunk',{download_id:downloadId,offset});
+    const result = unwrap(raw);
+    if (result.error || typeof result.meta.data_base64 !== 'string') throw new Error('文件传输失败或已过期，请重新下载文献。');
+    const binary = atob(result.meta.data_base64), bytes = new Uint8Array(binary.length);
+    for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+    if (result.data.offset !== offset || result.data.byte_count !== bytes.length) throw new Error('文件分片校验失败。');
+    return bytes;
+  }
+  function getFile() {
+    if (filePromise) return filePromise;
+    filePromise = (async () => {
+      const size = artifact.byte_size, step = artifact.chunk_size;
+      if (!Number.isSafeInteger(size) || size <= 0 || size > 20*1024*1024 || step !== 512*1024) throw new Error('文件信息无效。');
+      const count = Math.ceil(size/step), blocks = new Array(count); let finished = 0, cursor = 0;
+      $('progress').hidden = false; $('progress').max = size; $('progress').value = 0;
+      const worker = async () => {
+        while (cursor < count) {
+          const index = cursor++;
+          blocks[index] = await callChunk(index*step); finished += blocks[index].length;
+          $('progress').value = finished; status('正在传输文件 ' + Math.round(finished/size*100) + '%…');
+        }
+      };
+      await Promise.all(Array.from({length:Math.min(3,count)},worker));
+      const file = new File(blocks,artifact.file_name,{type:artifact.mime_type});
+      if (file.size !== size) throw new Error('文件长度校验失败。');
+      const sum = new Uint8Array(await crypto.subtle.digest('SHA-256',await file.arrayBuffer()));
+      const hex = [...sum].map(x=>x.toString(16).padStart(2,'0')).join('');
+      if (hex !== artifact.sha256) throw new Error('文件完整性校验失败。');
+      $('progress').hidden = true;
+      return file;
+    })().catch(error=>{filePromise=null;throw error;});
+    return filePromise;
+  }
+  async function upload(library) {
+    const old = previousState();
+    if (!library && old.download_id === downloadId && old.file_id) return old.file_id;
+    if (typeof window.openai?.uploadFile !== 'function') throw new Error('当前环境未提供 Space 文件保存接口；仍可选择本机下载。');
+    if (library && typeof window.openai?.selectFiles !== 'function') throw new Error('当前账号未提供 Space 文件库接口；请改选本机下载。');
+    if (!uploadPromise) uploadPromise = (async () => {
+      const file = await getFile(); status(library ? '正在保存到 Space…' : '正在准备下载链接…');
+      const result = await window.openai.uploadFile(file,{library});
+      if (!result?.fileId) throw new Error('文件保存未成功，请重试。');
+      persist({file_id:result.fileId,library_requested:library,saved_to_space:false,space_status:'unverified'});
+      return result.fileId;
+    })().finally(()=>{uploadPromise=null;});
+    return uploadPromise;
+  }
+  function showLink(url) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') throw new Error('下载地址无效。');
+    nativeDownload = false;
+    $('download').href = url; $('download').target = '_blank'; $('download').download = artifact.file_name; $('download').hidden = false;
+    $('download').textContent = '下载 ' + artifact.format.toUpperCase();
+    if (parsed.protocol === 'https:') {
+      $('browser-download').href = url; $('browser-download').hidden = false;
+      $('download-url').value = url; $('copy-link').hidden = false;
+    }
+  }
+  function showNativeDownload() {
+    nativeDownload = true;
+    $('download').href = '#'; $('download').removeAttribute('target'); $('download').hidden = false;
+    $('download').textContent = '保存 ' + artifact.format.toUpperCase() + ' 到本机';
+  }
+  async function prepareLocal() {
+    if (bridgeReady && hostCapabilities.downloadFile) {
+      await getFile(); showNativeDownload();
+      status('文件已校验，点击保存并选择本机位置。');
+      return;
+    }
+    if (delivery?.url) {
+      if (!Number.isFinite(delivery.expires_at) || delivery.expires_at <= Date.now()/1000)
+        throw new Error('下载链接已过期，请重新请求这篇文献生成新卡片。');
+      showLink(delivery.url);
+      status('下载链接已就绪，有效期最多10分钟；可在浏览器打开或复制链接。');
+      return;
+    }
+    if (typeof window.openai?.uploadFile === 'function' && typeof window.openai?.getFileDownloadUrl === 'function') {
+      const fileId = await upload(false), link = await window.openai.getFileDownloadUrl({fileId});
+      showLink(link.downloadUrl);
+      status('点击下载；若客户端没有打开，请选择“在浏览器下载”或复制链接。');
+      return;
+    }
+    throw new Error('当前客户端尚未开放文件保存接口，服务器也未启用HTTPS下载通道。请使用网页版获取文件，或联系服务管理员启用下载通道。');
+  }
+  async function saveNativeFile() {
+    if (active) return;
+    active = true; $('save').disabled = $('prepare').disabled = true;
+    try {
+      const file = await getFile(), bytes = new Uint8Array(await file.arrayBuffer());
+      const pieces = [];
+      for (let offset=0;offset<bytes.length;offset+=16384) pieces.push(String.fromCharCode(...bytes.subarray(offset,offset+16384)));
+      status('正在请求客户端保存文件…');
+      const result = await rpc('ui/download-file',{contents:[{type:'resource',resource:{
+        uri:'file:///' + encodeURIComponent(artifact.file_name),mimeType:artifact.mime_type,blob:btoa(pieces.join(''))}}]});
+      if (result?.isError) { status('保存已取消或被客户端拒绝，可以再次点击保存。',true); return; }
+      status('客户端已接受保存请求，请检查所选位置或下载列表。');
+    } catch (error) {
+      if (error.code === -32601) {
+        delete hostCapabilities.downloadFile;
+        try { await prepareLocal(); status('客户端不支持直接保存，已改为浏览器下载链接。'); }
+        catch (_) { status('当前客户端无法直接保存，服务器尚未提供可用下载链接。',true); }
+      } else status(error.message || '客户端保存失败，请重试。',true);
+    } finally { active=false; $('save').disabled=$('prepare').disabled=false; }
+  }
+  async function run(destination) {
+    if (active || !artifact || !downloadId) return;
+    active = true; $('save').disabled = $('prepare').disabled = true;
+    try {
+      if (destination === 'space') {
+        const fileId = await upload(true);
+        $('saved').hidden = true;
+        if (typeof window.openai?.getFileDownloadUrl === 'function') {
+          try { const link = await window.openai.getFileDownloadUrl({fileId}); showLink(link.downloadUrl); } catch (_) {}
+        }
+        status('文件已上传，但尚未确认写入 Space。可先通过下载链接保存到本机。');
+      } else {
+        await prepareLocal();
+      }
+    } catch (error) { status(error.message || '操作失败，请重试。',true); }
+    finally { active=false; $('save').disabled=$('prepare').disabled=false; $('progress').hidden=true; }
+  }
+  function chooseDefault() {
+    if (autoStarted || !artifact || !downloadId || (!bridgeReady && !window.openai?.callTool)) return;
+    const destination = requestedDestination === 'auto'
+      ? (context.platform === 'web' ? 'space' : context.platform === 'desktop' ? 'local' : null)
+      : requestedDestination;
+    if (!destination) return;
+    autoStarted=true;
+    if (destination === 'space') {
+      status('点击“保存到 Space”尝试直接保存 PDF；以实际资料库结果为准。');
+      return;
+    }
+    void run(destination);
+  }
+  $('save').addEventListener('click',()=>run('space'));
+  $('prepare').addEventListener('click',()=>run('local'));
+  $('download').addEventListener('click',event=>{
+    if (nativeDownload) { event.preventDefault(); void saveNativeFile(); return; }
+    if (bridgeReady && hostCapabilities.openLinks && $('download').href.startsWith('https:')) {
+      event.preventDefault();
+      void rpc('ui/open-link',{url:$('download').href}).then(result=>{
+        if (result?.isError) throw new Error('客户端拒绝打开下载链接。');
+        status('已请求打开下载链接，请检查浏览器下载列表。');
+      }).catch(()=>status('客户端未能打开链接，请选择“在浏览器下载”或复制下载链接。',true));
+    }
+  });
+  $('copy-link').addEventListener('click',async()=>{
+    try { await navigator.clipboard.writeText($('download-url').value); status('下载链接已复制，请粘贴到浏览器地址栏。'); }
+    catch (_) { $('download-url').hidden=false; $('download-url').select(); status('下载链接已选中，请复制后粘贴到浏览器地址栏。'); }
+  });
+  window.addEventListener('message',event=>{
+    if (event.source !== parent || !event.data || event.data.jsonrpc !== '2.0') return;
+    const m=event.data;
+    if (m.id && pending.has(m.id)) {
+      const item=pending.get(m.id);pending.delete(m.id);clearTimeout(item.timer);
+      if (m.error) item.reject(Object.assign(new Error(m.error.message || '宿主操作失败。'),{code:m.error.code})); else item.resolve(m.result);
+    } else if (m.method==='ui/notifications/tool-result') ingest(m.params);
+    else if (m.method==='ui/notifications/host-context-changed') applyContext(m.params || {});
+  });
+  window.addEventListener('openai:set_globals',()=>{
+    const globals=window.openai;
+    if (globals?.toolOutput) ingest({structuredContent:globals.toolOutput,_meta:unwrap(globals.toolResponseMetadata).meta});
+  });
+  rpc('ui/initialize',{protocolVersion:'2026-01-26',appInfo:{name:'campus-article-download',version:'1.1.5'},
+      appCapabilities:{availableDisplayModes:['inline','fullscreen']}})
+    .then(result=>{bridgeReady=true;hostCapabilities=result.hostCapabilities || {};notify('ui/notifications/initialized');applyContext(result.hostContext || {});})
+    .catch(()=>{if(!window.openai?.callTool) status('当前宿主未提供交互文件组件支持。',true);chooseDefault();});
+  if (window.openai?.toolOutput) ingest({structuredContent:window.openai.toolOutput,_meta:unwrap(window.openai.toolResponseMetadata).meta});
+  new ResizeObserver(()=>notify('ui/notifications/size-changed',{height:document.body.scrollHeight})).observe(document.body);
+})();
+</script></body></html>

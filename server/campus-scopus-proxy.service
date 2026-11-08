@@ -1,0 +1,29 @@
+[Unit]
+Description=Dedicated outbound proxy for campus OpenAI MCP tunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=campus-scopus
+Group=campus-scopus
+LoadCredential=proxy.yaml:/etc/campus-scopus/proxy.yaml
+ExecStart=/usr/local/bin/mihomo -d /var/lib/campus-scopus/proxy -f ${CREDENTIALS_DIRECTORY}/proxy.yaml
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/var/lib/campus-scopus/proxy
+
+[Install]
+WantedBy=multi-user.target

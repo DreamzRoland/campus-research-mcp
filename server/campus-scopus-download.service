@@ -1,0 +1,23 @@
+[Unit]
+Description=Optional expiring campus article file delivery (loopback only)
+After=network.target
+ConditionPathExists=/etc/campus-scopus/delivery.env
+
+[Service]
+Type=simple
+User=campus-scopus
+Group=campus-scopus
+EnvironmentFile=/etc/campus-scopus/delivery.env
+ExecStart=/var/lib/campus-scopus/.venv/bin/python /opt/campus-scopus/file_delivery.py
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+[Unit]
+Description=Campus Scopus and ScienceDirect MCP via OpenAI Secure MCP Tunnel
+Wants=network-online.target campus-scopus-proxy.service
+After=network-online.target campus-scopus-proxy.service
+ConditionPathExists=/etc/campus-scopus/ready
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=campus-scopus
+Group=campus-scopus
+WorkingDirectory=/opt/campus-scopus
+Environment=HOME=/var/lib/campus-scopus
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=NO_PROXY=localhost,127.0.0.1,::1,api.elsevier.com,.elsevier.com
+LoadCredential=elsevier.json:/etc/campus-scopus/secrets.json
+ExecStart=/usr/bin/python3 /opt/campus-scopus/run_tunnel.py
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/campus-scopus
+
+[Install]
+WantedBy=multi-user.target

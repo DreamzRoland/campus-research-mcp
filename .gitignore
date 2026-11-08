@@ -1,0 +1,41 @@
+# Never commit credentials or local state.
+.env
+.env.*
+!.env.example
+secrets.json
+proxy.yaml
+credentials/
+.ssh/
+.aws/
+.codex/
+*.pem
+*.key
+*.p12
+*.pfx
+# Private state and downloaded copyrighted content
+.sync/
+outputs/
+downloads/
+research.sqlite3*
+*.sqlite*
+*.db
+aip-jobs/
+publisher-jobs/
+space_receipts.json
+*.pdf
+*.bin
+*.part
+*.zip
+*.tar.gz
+*.log
+# Local environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
